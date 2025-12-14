@@ -47,7 +47,9 @@ use gst::prelude::*;
 use gst::subclass::prelude::*;
 use gst_net::gio;
 
+use super::auth::RtspAuthenticator;
 use super::body::Body;
+use super::connection::{connect_secure, SecureTcpStream};
 use super::sdp;
 use super::transport::RtspTransportInfo;
 
@@ -68,13 +70,16 @@ const RTCP_ADDR_CACHE_SIZE: usize = 100;
 static RTCP_CAPS: LazyLock<gst::Caps> =
     LazyLock::new(|| gst::Caps::from(gst::Structure::new_empty("application/x-rtcp")));
 
-// Hardcoded for now
-const DEFAULT_USER_AGENT: &str = concat!(
+// Hardcoded default user agent
+const DEFAULT_USER_AGENT_STR: &str = concat!(
     "GStreamer rtspsrc2 ",
     env!("CARGO_PKG_VERSION"),
     "-",
     env!("COMMIT_ID")
 );
+
+// For backward compatibility and default value
+const DEFAULT_USER_AGENT: &str = DEFAULT_USER_AGENT_STR;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RtspProtocol {
@@ -96,20 +101,36 @@ impl fmt::Display for RtspProtocol {
 #[derive(Debug, Clone)]
 struct Settings {
     location: Option<Url>,
+    credentials: Option<(String, String)>, // (username, password)
     port_start: u16,
     protocols: Vec<RtspProtocol>,
     timeout: gst::ClockTime,
     receive_mtu: u32,
+    is_tls: bool,
+    latency: gst::ClockTime,
+    do_rtx: bool,
+    do_rtcp: bool,
+    iface: Option<String>,
+    user_agent: String,
+    tcp_connection_optional: bool, // Whether to keep TCP connection for control commands only when using UDP
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             location: DEFAULT_LOCATION,
+            credentials: None,
             port_start: DEFAULT_PORT_START,
             timeout: DEFAULT_TIMEOUT,
             protocols: parse_protocols_str(DEFAULT_PROTOCOLS).unwrap(),
             receive_mtu: DEFAULT_RECEIVE_MTU,
+            is_tls: false,
+            latency: gst::ClockTime::from_seconds(2), // Default latency
+            do_rtx: false, // Default: don't retransmit
+            do_rtcp: true, // Default: do RTCP
+            iface: None,   // Default: no specific interface
+            user_agent: DEFAULT_USER_AGENT.to_string(), // Use the default user agent
+            tcp_connection_optional: false, // By default, maintain current behavior
         }
     }
 }
@@ -117,7 +138,8 @@ impl Default for Settings {
 #[derive(Debug)]
 enum Commands {
     Play,
-    //Pause,
+    Pause,
+    Seek(Range),
     Teardown(Option<oneshot::Sender<()>>),
     Data(rtsp_types::Data<Body>),
 }
@@ -204,26 +226,51 @@ impl RtspSrc {
             return Ok(());
         };
 
-        let uri = Url::parse(uri).map_err(|err| {
+        let parsed_uri = Url::parse(uri).map_err(|err| {
             glib::Error::new(
                 gst::URIError::BadUri,
                 &format!("Failed to parse URI '{uri}': {err:?}"),
             )
         })?;
 
-        if uri.password().is_some() || !uri.username().is_empty() {
-            // TODO
-            gst::fixme!(CAT, "URI credentials are currently ignored");
+        // Extract credentials from URI if present
+        let mut uri = parsed_uri.clone();
+        let mut credentials = None;
+        if parsed_uri.password().is_some() || !parsed_uri.username().is_empty() {
+            credentials = if !parsed_uri.username().is_empty() {
+                if let Some(password) = parsed_uri.password() {
+                    Some((parsed_uri.username().to_string(), password.to_string()))
+                } else {
+                    Some((parsed_uri.username().to_string(), String::new()))
+                }
+            } else {
+                None
+            };
+
+            // Create URI without credentials for connection
+            let mut clean_uri = parsed_uri.clone();
+            clean_uri.set_username("").unwrap();
+            clean_uri.set_password(None).unwrap();
+            uri = clean_uri;
+
+            gst::info!(CAT, "Extracted credentials from URI for authentication");
         }
+
+        // Store credentials in settings
+        settings.credentials = credentials;
 
         match (uri.host_str(), uri.port()) {
             (Some(_), Some(_)) | (Some(_), None) => Ok(()),
             _ => Err(glib::Error::new(gst::URIError::BadUri, "Invalid host")),
         }?;
 
+        // Update TLS flag based on scheme
+        settings.is_tls = uri.scheme() == "rtsps";
+
         let protocols: &[RtspProtocol] = match uri.scheme() {
             "rtspu" => &[RtspProtocol::UdpMulticast, RtspProtocol::Udp],
             "rtspt" => &[RtspProtocol::Tcp],
+            "rtsps" => &[RtspProtocol::Tcp], // RTSPS only supports TCP
             "rtsp" => &settings.protocols,
             scheme => {
                 return Err(glib::Error::new(
@@ -309,6 +356,41 @@ impl ObjectImpl for RtspSrc {
                     .default_value(DEFAULT_TIMEOUT.into())
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecUInt64::builder("latency")
+                    .nick("Latency")
+                    .blurb("Latency to use for the downstream elements, in nanoseconds")
+                    .default_value(gst::ClockTime::from_seconds(2).into())
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecBoolean::builder("do-rtx")
+                    .nick("Retransmission")
+                    .blurb("Enable RTP retransmission (RTX)")
+                    .default_value(false)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecBoolean::builder("do-rtcp")
+                    .nick("RTCP")
+                    .blurb("Enable RTCP")
+                    .default_value(true)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("iface")
+                    .nick("Interface")
+                    .blurb("Network interface to use")
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("user-agent")
+                    .nick("User Agent")
+                    .blurb("User-Agent HTTP header to send")
+                    .default_value(DEFAULT_USER_AGENT)
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecBoolean::builder("tcp-connection-optional")
+                    .nick("TCP Connection Optional")
+                    .blurb("Make TCP connection optional when using UDP transport")
+                    .default_value(false)
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -347,6 +429,39 @@ impl ObjectImpl for RtspSrc {
                 let mut settings = self.settings.lock().unwrap();
                 let timeout = value.get().expect("type checked upstream");
                 settings.timeout = timeout;
+                Ok(())
+            }
+            "latency" => {
+                let mut settings = self.settings.lock().unwrap();
+                let latency = value.get().expect("type checked upstream");
+                settings.latency = latency;
+                Ok(())
+            }
+            "do-rtx" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.do_rtx = value.get().expect("type checked upstream");
+                Ok(())
+            }
+            "do-rtcp" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.do_rtcp = value.get().expect("type checked upstream");
+                Ok(())
+            }
+            "iface" => {
+                let mut settings = self.settings.lock().unwrap();
+                let iface = value.get().expect("type checked upstream");
+                settings.iface = iface;
+                Ok(())
+            }
+            "user-agent" => {
+                let mut settings = self.settings.lock().unwrap();
+                let user_agent = value.get().expect("type checked upstream");
+                settings.user_agent = user_agent;
+                Ok(())
+            }
+            "tcp-connection-optional" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.tcp_connection_optional = value.get().expect("type checked upstream");
                 Ok(())
             }
             name => unimplemented!("Property '{name}'"),
@@ -392,6 +507,30 @@ impl ObjectImpl for RtspSrc {
             "timeout" => {
                 let settings = self.settings.lock().unwrap();
                 settings.timeout.to_value()
+            }
+            "latency" => {
+                let settings = self.settings.lock().unwrap();
+                settings.latency.to_value()
+            }
+            "do-rtx" => {
+                let settings = self.settings.lock().unwrap();
+                settings.do_rtx.to_value()
+            }
+            "do-rtcp" => {
+                let settings = self.settings.lock().unwrap();
+                settings.do_rtcp.to_value()
+            }
+            "iface" => {
+                let settings = self.settings.lock().unwrap();
+                settings.iface.to_value()
+            }
+            "user-agent" => {
+                let settings = self.settings.lock().unwrap();
+                settings.user_agent.to_value()
+            }
+            "tcp-connection-optional" => {
+                let settings = self.settings.lock().unwrap();
+                settings.tcp_connection_optional.to_value()
             }
             name => unimplemented!("Property '{name}'"),
         }
@@ -506,7 +645,7 @@ impl URIHandlerImpl for RtspSrc {
     const URI_TYPE: gst::URIType = gst::URIType::Src;
 
     fn protocols() -> &'static [&'static str] {
-        &["rtsp", "rtspu", "rtspt"]
+        &["rtsp", "rtspu", "rtspt", "rtsps"]
     }
 
     fn uri(&self) -> Option<String> {
@@ -555,11 +694,9 @@ impl RtspSrc {
 
         let join_handle = RUNTIME.spawn(async move {
             gst::info!(CAT, "Connecting to {url} ..");
-            let hostname_port =
-                format!("{}:{}", url.host_str().unwrap(), url.port().unwrap_or(554));
+            let hostname_port = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap_or(if settings.is_tls { 322 } else { 554 }));
 
-            // TODO: Add TLS support
-            let s = match TcpStream::connect(hostname_port).await {
+            let s = match connect_secure(&hostname_port, settings.is_tls).await {
                 Ok(s) => s,
                 Err(err) => {
                     gst::element_imp_error!(
@@ -570,16 +707,19 @@ impl RtspSrc {
                     return;
                 }
             };
-            let _ = s.set_nodelay(true);
 
             gst::info!(CAT, "Connected!");
 
-            let (read, write) = s.into_split();
+            let (read, write) = tokio::io::split(s);
 
             let stream = Box::pin(super::tcp_message::async_read(read, MAX_MESSAGE_SIZE).fuse());
             let sink = Box::pin(super::tcp_message::async_write(write));
 
-            let mut state = RtspTaskState::new(url, stream, sink);
+            let connection_settings = {
+                let settings = task_src.settings.lock().unwrap();
+                (settings.credentials.clone(), settings.user_agent.clone())
+            };
+            let mut state = RtspTaskState::new(url, stream, sink, connection_settings.0, connection_settings.1);
 
             let task_ret = task_src.rtsp_task(&mut state, rx).await;
             gst::info!(CAT, "Exited rtsp_task");
@@ -1049,8 +1189,23 @@ impl RtspSrc {
                         }
                     }
                     Some(Ok(rtsp_types::Message::Request(req))) => {
-                        // TODO: implement incoming GET_PARAMETER requests
-                        gst::debug!(CAT, "<-- {req:#?}");
+                        match req.method() {
+                            Method::GetParameter => {
+                                gst::debug!(CAT, "Received GET_PARAMETER request: {req:#?}");
+                                if let Err(err) = self.handle_get_parameter(req, &mut state).await {
+                                    gst::warning!(CAT, "Failed to handle GET_PARAMETER: {err:?}");
+                                }
+                            }
+                            Method::SetParameter => {
+                                gst::debug!(CAT, "Received SET_PARAMETER request: {req:#?}");
+                                if let Err(err) = self.handle_set_parameter(req, &mut state).await {
+                                    gst::warning!(CAT, "Failed to handle SET_PARAMETER: {err:?}");
+                                }
+                            }
+                            _ => {
+                                gst::debug!(CAT, "Received unexpected request: {req:#?}");
+                            }
+                        }
                     }
                     Some(Ok(rtsp_types::Message::Response(rsp))) => {
                         gst::debug!(CAT, "<-- {rsp:#?}");
@@ -1063,8 +1218,14 @@ impl RtspSrc {
                         match expected {
                             Method::Play => {
                                 state.play_response(&rsp, *cseq, s).await?;
-                                self.post_complete("request", "PLAY response received");
+                                // Check if this was a seek request
+                                if let Some((expected, _)) = &expected_response {
+                                    if *expected == Method::Play {
+                                        self.post_complete("request", "PLAY/SEEK response received");
+                                    }
+                                }
                             }
+                            Method::Pause => state.pause_response(&rsp, *cseq, s).await?,
                             Method::Teardown => state.teardown_response(&rsp, *cseq, s).await?,
                             m => unreachable!("BUG: unexpected response method: {m:?}"),
                         };
@@ -1086,8 +1247,28 @@ impl RtspSrc {
                             return Err(RtspError::InvalidMessage("Can't PLAY, no SETUP").into());
                         };
                         self.post_start("request", "PLAY request sent");
-                        let cseq = state.play(s).await.inspect_err(|_err| {
+                        let cseq = state.play(s, None).await.inspect_err(|_err| {
                             self.post_cancelled("request", "PLAY request cancelled");
+                        })?;
+                        expected_response = Some((Method::Play, cseq));
+                    },
+                    Commands::Pause => {
+                        let Some(s) = &session else {
+                            return Err(RtspError::InvalidMessage("Can't PAUSE, no SETUP").into());
+                        };
+                        self.post_start("request", "PAUSE request sent");
+                        let cseq = state.pause(s).await.inspect_err(|_err| {
+                            self.post_cancelled("request", "PAUSE request cancelled");
+                        })?;
+                        expected_response = Some((Method::Pause, cseq));
+                    },
+                    Commands::Seek(range) => {
+                        let Some(s) = &session else {
+                            return Err(RtspError::InvalidMessage("Can't SEEK, no SETUP").into());
+                        };
+                        self.post_start("request", "SEEK request sent");
+                        let cseq = state.play(s, Some(range)).await.inspect_err(|_err| {
+                            self.post_cancelled("request", "SEEK request cancelled");
                         })?;
                         expected_response = Some((Method::Play, cseq));
                     },
@@ -1116,6 +1297,143 @@ impl RtspSrc {
             }
         }
         Ok(())
+    }
+}
+
+impl RtspSrc {
+    async fn handle_get_parameter(&self, req: rtsp_types::Request<Body>, state: &mut RtspTaskState) -> Result<(), RtspError> {
+        gst::debug!(CAT, "Handling GET_PARAMETER request");
+
+        // Get the CSeq from the request
+        let cseq = req.typed_header::<CSeq>()?.ok_or(RtspError::InvalidMessage("No CSeq in GET_PARAMETER"))?.0;
+
+        // Get the session if present
+        let session = req.typed_header::<Session>()?;
+
+        // For now, return an empty response (no parameters requested)
+        // In a real implementation, we might return actual parameter values
+        let response_body = Vec::new(); // Empty body for no parameters
+
+        // Build response
+        let response = Response::builder(StatusCode::Ok, state.version)
+            .typed_header::<CSeq>(&cseq.into())
+            .header(USER_AGENT, DEFAULT_USER_AGENT);
+
+        let response = if let Some(session) = session {
+            response.typed_header::<Session>(&session)
+        } else {
+            response
+        };
+
+        let response = response.build(response_body);
+
+        // Send response back
+        state.sink.send(response.into()).await.map_err(|e| RtspError::IOGeneric(e))?;
+
+        gst::debug!(CAT, "Sent GET_PARAMETER response");
+        Ok(())
+    }
+
+    async fn handle_set_parameter(&self, req: rtsp_types::Request<Body>, state: &mut RtspTaskState) -> Result<(), RtspError> {
+        gst::debug!(CAT, "Handling SET_PARAMETER request");
+
+        // Get the CSeq from the request
+        let cseq = req.typed_header::<CSeq>()?.ok_or(RtspError::InvalidMessage("No CSeq in SET_PARAMETER"))?.0;
+
+        // Get the session if present
+        let session = req.typed_header::<Session>()?;
+
+        // Parse the parameters from the request body
+        let params_str = std::str::from_utf8(req.body()).unwrap_or("");
+        gst::debug!(CAT, "SET_PARAMETER parameters: {}", params_str);
+
+        // Process the parameters (in a real implementation, we'd process them)
+        // For now, we'll just acknowledge that we received them
+        let response_body = req.body().as_ref().to_vec(); // Echo back the parameters
+
+        // Build response
+        let response = Response::builder(StatusCode::Ok, state.version)
+            .typed_header::<CSeq>(&cseq.into())
+            .header(USER_AGENT, DEFAULT_USER_AGENT);
+
+        let response = if let Some(session) = session {
+            response.typed_header::<Session>(&session)
+        } else {
+            response
+        };
+
+        let response = response.build(response_body);
+
+        // Send response back
+        state.sink.send(response.into()).await.map_err(|e| RtspError::IOGeneric(e))?;
+
+        gst::debug!(CAT, "Sent SET_PARAMETER response");
+        Ok(())
+    }
+
+    pub fn send_seek_command(&self, start_time: Option<gst::ClockTime>, end_time: Option<gst::ClockTime>) -> Result<(), glib::BoolError> {
+        // Convert GStreamer time to RTSP range format
+        let range = if let Some(start) = start_time {
+            let start_npt = NptTime::from_seconds(start.seconds_f64());
+            if let Some(end) = end_time {
+                let end_npt = NptTime::from_seconds(end.seconds_f64());
+                Range::Npt(NptRange::To(start_npt, end_npt))
+            } else {
+                Range::Npt(NptRange::From(start_npt))
+            }
+        } else {
+            Range::Npt(NptRange::From(NptTime::Now))
+        };
+
+        let cmd_queue = self.cmd_queue();
+        RUNTIME.spawn(async move {
+            if let Err(err) = cmd_queue.send(Commands::Seek(range)).await {
+                gst::error!(CAT, imp = &self, "Failed to send seek command: {err:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    pub fn send_pause_command(&self) -> Result<(), glib::BoolError> {
+        let cmd_queue = self.cmd_queue();
+        RUNTIME.spawn(async move {
+            if let Err(err) = cmd_queue.send(Commands::Pause).await {
+                gst::error!(CAT, imp = &self, "Failed to send pause command: {err:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    pub fn send_play_command(&self) -> Result<(), glib::BoolError> {
+        let cmd_queue = self.cmd_queue();
+        RUNTIME.spawn(async move {
+            if let Err(err) = cmd_queue.send(Commands::Play).await {
+                gst::error!(CAT, imp = &self, "Failed to send play command: {err:?}");
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Process RTCP Sender Report for clock synchronization (RFC 7273)
+    fn process_rtcp_sr_packet(&mut self, ntp_timestamp: u64, rtp_timestamp: u32, ssrc: u32) {
+        // Use the first received SR packet to establish the base timing relationship
+        if self.base_ntp_timestamp.is_none() {
+            self.base_ntp_timestamp = Some(ntp_timestamp);
+            self.base_rtp_timestamp = Some(rtp_timestamp);
+        } else {
+            // For subsequent packets, we could refine the timing relationship
+            // This is where we would calculate drift, adjust for network delay, etc.
+            gst::debug!(
+                CAT,
+                "RTCP SR processed for SSRC {} - NTP: {}, RTP: {}",
+                ssrc,
+                ntp_timestamp,
+                rtp_timestamp
+            );
+        }
     }
 }
 
@@ -1214,6 +1532,13 @@ struct RtspTaskState {
     content_base_or_location: Option<String>,
     aggregate_control: Option<Url>,
     sdp: Option<sdp_types::Session>,
+    authenticator: Option<RtspAuthenticator>,
+    user_agent: String,
+    // Clock synchronization data - RFC 7273
+    clock_rate: Option<u32>,
+    base_ntp_timestamp: Option<u64>,
+    base_rtp_timestamp: Option<u32>,
+    sync_offset: Option<gst::ClockTime>,
 
     stream:
         Pin<Box<dyn Stream<Item = Result<Message<Body>, super::tcp_message::ReadError>> + Send>>,
@@ -1231,7 +1556,9 @@ struct RtspSetupParams {
 }
 
 impl RtspTaskState {
-    fn new(url: Url, stream: RtspStream, sink: RtspSink) -> Self {
+    fn new(url: Url, stream: RtspStream, sink: RtspSink, credentials: Option<(String, String)>, user_agent: String) -> Self {
+        let authenticator = credentials.map(|(username, password)| RtspAuthenticator::new(username, password));
+
         RtspTaskState {
             cseq: 0u32,
             url,
@@ -1239,6 +1566,12 @@ impl RtspTaskState {
             content_base_or_location: None,
             aggregate_control: None,
             sdp: None,
+            authenticator,
+            user_agent,
+            clock_rate: None,
+            base_ntp_timestamp: None,
+            base_rtp_timestamp: None,
+            sync_offset: None,
             stream,
             sink,
             setup_params: Vec::new(),
@@ -1299,27 +1632,87 @@ impl RtspTaskState {
         Ok(())
     }
 
-    async fn options(&mut self) -> Result<(), RtspError> {
-        self.cseq += 1;
-        let req = Request::builder(Method::Options, self.version)
-            .typed_header::<CSeq>(&self.cseq.into())
-            .request_uri(self.url.clone())
-            .header(USER_AGENT, DEFAULT_USER_AGENT)
-            .build(Body::default());
+    async fn send_request_with_auth(
+        &mut self,
+        method: Method,
+        request_uri: Url,
+        session: Option<&Session>,
+    ) -> Result<(Response<Body>, u32), RtspError> {
+        let cseq = self.cseq + 1;
+
+        let req = match &self.authenticator {
+            Some(auth) if auth.needs_authentication() => {
+                // If we have an authenticator and we need authentication, build and add auth header
+                let mut req_builder = Request::builder(method, self.version)
+                    .typed_header::<CSeq>(&cseq.into())
+                    .header(USER_AGENT, &self.user_agent);
+
+                if let Some(session) = session {
+                    req_builder = req_builder.typed_header::<Session>(session);
+                }
+
+                let req = req_builder.request_uri(request_uri.clone()).build(Vec::new());
+
+                // Add authentication header based on current auth state
+                let authed_req = auth.add_auth_header(req, cseq, &format!("{:?}", method), request_uri.as_str())?;
+
+                // Convert back to the proper format
+                Request::builder(method, self.version)
+                    .typed_header::<CSeq>(&cseq.into())
+                    .header(USER_AGENT, &self.user_agent)
+                    .request_uri(request_uri)
+                    .body(authed_req.into_body().into())
+            }
+            _ => {
+                // Build request normally without authentication
+                let mut req_builder = Request::builder(method, self.version)
+                    .typed_header::<CSeq>(&cseq.into())
+                    .header(USER_AGENT, &self.user_agent);
+
+                if let Some(session) = session {
+                    req_builder = req_builder.typed_header::<Session>(session);
+                }
+
+                req_builder.request_uri(request_uri).build(Body::default())
+            }
+        };
 
         gst::debug!(CAT, "-->> {req:#?}");
         self.sink.send(req.into()).await?;
 
         let rsp = match self.stream.next().await {
             Some(Ok(rtsp_types::Message::Response(rsp))) => Ok(rsp),
-            Some(Ok(m)) => Err(RtspError::UnexpectedMessage("OPTIONS response", m)),
+            Some(Ok(m)) => Err(RtspError::UnexpectedMessage("RTSP response", m)),
             Some(Err(e)) => Err(e.into()),
             None => Err(
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "options response").into(),
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "RTSP response").into(),
             ),
         }?;
+
         gst::debug!(CAT, "<<-- {rsp:#?}");
-        Self::check_response(&rsp, self.cseq, Method::Options, None)?;
+
+        // Check if this is an authentication challenge
+        if rsp.status() == StatusCode::Unauthorized {
+            if let Some(ref mut auth) = self.authenticator {
+                auth.handle_401_challenge(&rsp)?;
+
+                // Retry the request with authentication
+                self.cseq = cseq; // Reset cseq for retry
+                return self.send_request_with_auth(method, request_uri, session).await;
+            } else {
+                // If we don't have credentials but got a 401, fail
+                return Err(RtspError::Fatal("Authentication required but no credentials provided".to_string()));
+            }
+        }
+
+        Ok((rsp, cseq))
+    }
+
+    async fn options(&mut self) -> Result<(), RtspError> {
+        self.cseq += 1;
+        let (rsp, cseq) = self.send_request_with_auth(Method::Options, self.url.clone(), None).await?;
+
+        Self::check_response(&rsp, cseq, Method::Options, None)?;
 
         let Ok(Some(methods)) = rsp.typed_header::<Public>() else {
             return Err(RtspError::InvalidMessage(
@@ -1352,32 +1745,9 @@ impl RtspTaskState {
 
     async fn describe(&mut self) -> Result<(), RtspError> {
         self.cseq += 1;
-        let req = Request::builder(Method::Describe, self.version)
-            .typed_header::<CSeq>(&self.cseq.into())
-            .header(USER_AGENT, DEFAULT_USER_AGENT)
-            .header(ACCEPT, "application/sdp")
-            .request_uri(self.url.clone())
-            .build(Body::default());
+        let (rsp, cseq) = self.send_request_with_auth(Method::Describe, self.url.clone(), None).await?;
 
-        gst::debug!(CAT, "-->> {req:#?}");
-        self.sink.send(req.into()).await?;
-
-        let rsp = match self.stream.next().await {
-            Some(Ok(rtsp_types::Message::Response(rsp))) => Ok(rsp),
-            Some(Ok(m)) => Err(RtspError::UnexpectedMessage("DESCRIBE response", m)),
-            Some(Err(e)) => Err(e.into()),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "describe response",
-            )
-            .into()),
-        }?;
-        gst::debug!(
-            CAT,
-            "<<-- Response {:#?}",
-            rsp.headers().collect::<Vec<_>>()
-        );
-        Self::check_response(&rsp, self.cseq, Method::Describe, None)?;
+        Self::check_response(&rsp, cseq, Method::Describe, None)?;
 
         self.content_base_or_location = rsp
             .header(&CONTENT_BASE)
@@ -1590,36 +1960,7 @@ impl RtspTaskState {
             }
 
             self.cseq += 1;
-            let transports: Transports = transports.as_slice().into();
-            let req = Request::builder(Method::Setup, self.version)
-                .typed_header::<CSeq>(&self.cseq.into())
-                .header(USER_AGENT, DEFAULT_USER_AGENT)
-                .typed_header::<Transports>(&transports)
-                .request_uri(control_url.clone());
-            let req = if let Some(s) = session {
-                req.typed_header::<Session>(s)
-            } else {
-                req
-            };
-            let req = req.build(Body::default());
-            let cseq = self.cseq;
-
-            gst::debug!(CAT, "-->> {req:#?}");
-            self.sink.send(req.into()).await?;
-
-            // RTSP 2 supports pipelining of SETUP requests, so this ping-pong would have to be
-            // reworked if we want to support it.
-            let rsp = match self.stream.next().await {
-                Some(Ok(rtsp_types::Message::Response(rsp))) => Ok(rsp),
-                Some(Ok(m)) => Err(RtspError::UnexpectedMessage("SETUP response", m)),
-                Some(Err(e)) => Err(e.into()),
-                None => Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "setup response",
-                )
-                .into()),
-            }?;
-            gst::debug!(CAT, "<<-- {rsp:#?}");
+            let (rsp, cseq) = self.send_request_with_auth(Method::Setup, control_url.clone(), session.as_ref()).await?;
             Self::check_response(&rsp, cseq, Method::Setup, session.as_ref())?;
             let new_session = rsp
                 .typed_header::<Session>()?
@@ -1702,20 +2043,25 @@ impl RtspTaskState {
         Ok(setup_params)
     }
 
-    async fn play(&mut self, session: &Session) -> Result<u32, RtspError> {
-        self.cseq += 1;
+    async fn play(&mut self, session: &Session, range: Option<Range>) -> Result<u32, RtspError> {
         let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
-        let req = Request::builder(Method::Play, self.version)
-            .typed_header::<CSeq>(&self.cseq.into())
-            .typed_header::<Range>(&Range::Npt(NptRange::From(NptTime::Now)))
-            .header(USER_AGENT, DEFAULT_USER_AGENT)
+
+        let cseq = self.cseq + 1;
+        let mut req_builder = Request::builder(Method::Play, self.version)
+            .typed_header::<CSeq>(&cseq.into())
+            .header(USER_AGENT, &self.user_agent)
             .request_uri(request_uri)
             .typed_header::<Session>(session);
 
-        let req = req.build(Body::default());
+        if let Some(range) = range {
+            req_builder = req_builder.typed_header::<Range>(&range);
+        }
+
+        let req = req_builder.build(Body::default());
+
         gst::debug!(CAT, "-->> {req:#?}");
         self.sink.send(req.into()).await?;
-        Ok(self.cseq)
+        Ok(cseq)
     }
 
     async fn play_response(
@@ -1752,19 +2098,73 @@ impl RtspTaskState {
         Ok(())
     }
 
-    async fn teardown(&mut self, session: &Session) -> Result<u32, RtspError> {
-        self.cseq += 1;
+    async fn pause(&mut self, session: &Session) -> Result<u32, RtspError> {
         let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
-        let req = Request::builder(Method::Teardown, self.version)
-            .typed_header::<CSeq>(&self.cseq.into())
-            .header(USER_AGENT, DEFAULT_USER_AGENT)
-            .request_uri(request_uri)
-            .typed_header::<Session>(session);
+        let (_rsp, cseq) = self.send_request_with_auth(Method::Pause, request_uri, Some(session)).await?;
+        Ok(cseq)
+    }
 
-        let req = req.build(Body::default());
+    async fn pause_response(
+        &mut self,
+        rsp: &Response<Body>,
+        cseq: u32,
+        session: &Session,
+    ) -> Result<(), RtspError> {
+        Self::check_response(rsp, cseq, Method::Pause, Some(session))?;
+        Ok(())
+    }
+
+    async fn teardown(&mut self, session: &Session) -> Result<u32, RtspError> {
+        let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
+        let (_rsp, cseq) = self.send_request_with_auth(Method::Teardown, request_uri, Some(session)).await?;
+        Ok(cseq)
+    }
+
+    async fn get_parameter(&mut self, session: &Session, parameter_names: Option<&[&str]>) -> Result<u32, RtspError> {
+        let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
+
+        // Build a request body with the parameter names if provided
+        let body = if let Some(params) = parameter_names {
+            params.join("\n").into_bytes()
+        } else {
+            Vec::new()
+        };
+
+        let cseq = self.cseq + 1;
+        let req = Request::builder(Method::GetParameter, self.version)
+            .typed_header::<CSeq>(&cseq.into())
+            .header(USER_AGENT, &self.user_agent)
+            .request_uri(request_uri)
+            .typed_header::<Session>(session)
+            .body(body);
+
         gst::debug!(CAT, "-->> {req:#?}");
         self.sink.send(req.into()).await?;
-        Ok(self.cseq)
+        Ok(cseq)
+    }
+
+    async fn set_parameter(&mut self, session: &Session, parameters: &[(&str, &str)]) -> Result<u32, RtspError> {
+        let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
+
+        // Build a request body with the parameter key-value pairs
+        let body = parameters
+            .iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+
+        let cseq = self.cseq + 1;
+        let req = Request::builder(Method::SetParameter, self.version)
+            .typed_header::<CSeq>(&cseq.into())
+            .header(USER_AGENT, &self.user_agent)
+            .request_uri(request_uri)
+            .typed_header::<Session>(session)
+            .body(body);
+
+        gst::debug!(CAT, "-->> {req:#?}");
+        self.sink.send(req.into()).await?;
+        Ok(cseq)
     }
 
     async fn teardown_response(

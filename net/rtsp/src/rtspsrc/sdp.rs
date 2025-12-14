@@ -357,13 +357,196 @@ fn parse_framesize(framesize: &str, s: &mut gst::structure::Structure) {
 }
 
 #[allow(clippy::result_large_err)]
+fn parse_extmap(extmap: &str, s: &mut gst::structure::Structure) -> Result<(), RtspError> {
+    let mut parts = extmap.split_whitespace();
+
+    // The format is: extmap-id direction extname [extensionattributes]
+    // where extmap-id is the ID for this extension
+    if let Some(extmap_id) = parts.next() {
+        s.set("extmap-id", extmap_id);
+
+        // Get the direction (may be present) and extension name
+        if let Some(value) = parts.next() {
+            // Check if the first part is a direction like sendonly, recvonly, etc
+            if ["sendonly", "recvonly", "sendrecv", "inactive"].contains(&value) {
+                s.set("extmap-direction", value);
+                // If there's more after the direction, that should be the extension name
+                if let Some(extname) = parts.next() {
+                    s.set("extmap-extname", extname);
+                }
+            } else {
+                // No direction, so the first part is the extension name
+                s.set("extmap-extname", value);
+            }
+        }
+
+        // Any remaining parts are extension attributes
+        let remaining: Vec<&str> = parts.collect();
+        if !remaining.is_empty() {
+            s.set("extmap-attrs", remaining.join(" "));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_key_mgmt(key_mgmt: &str, s: &mut gst::structure::Structure) -> Result<(), RtspError> {
+    // The format is typically: key-type key-mgmt-uri
+    let parts: Vec<&str> = key_mgmt.split_whitespace().collect();
+
+    if parts.is_empty() {
+        return Ok(());
+    }
+
+    // The first part is usually the key type (e.g., "uri:00")
+    if let Some(key_type) = parts.first() {
+        s.set("key-type", key_type);
+    }
+
+    // The remaining parts form the key management URI
+    if parts.len() > 1 {
+        let uri = parts[1..].join(" ");
+        s.set("key-mgmt-uri", uri);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_rid(rid: &str, s: &mut gst::structure::Structure) -> Result<(), RtspError> {
+    // The format is: rid-id [direction] [pt=pt-list] [max-width=max-width] [max-height=max-height] [max-fps=max-fps] ...
+    let mut params = rid.split_whitespace();
+
+    if let Some(rid_id) = params.next() {
+        s.set("rid-id", rid_id);
+
+        // Parse the remaining parameters
+        for param in params {
+            if param.starts_with("pt=") {
+                let pt_list = &param[3..]; // Remove "pt=" prefix
+                s.set("rid-pt", pt_list);
+            } else if param.starts_with("max-width=") {
+                let width = &param[10..]; // Remove "max-width=" prefix
+                s.set("max-width", width);
+            } else if param.starts_with("max-height=") {
+                let height = &param[11..]; // Remove "max-height=" prefix
+                s.set("max-height", height);
+            } else if param.starts_with("max-fps=") {
+                let fps = &param[8..]; // Remove "max-fps=" prefix
+                s.set("max-fps", fps);
+            } else if param.starts_with("depend=") {
+                let depend = &param[7..]; // Remove "depend=" prefix
+                s.set("rid-depend", depend);
+            } else {
+                // Try to parse as direction if it's one of the standard values
+                if ["send", "recv"].contains(&param) {
+                    s.set("rid-direction", param);
+                } else {
+                    // Treat as additional parameter
+                    s.set(format!("a-rid-param-{}", param), "");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_rtcp_fb(rtcp_fb: &str, s: &mut gst::structure::Structure) -> Result<(), RtspError> {
+    // The format is: [payload type] feedback_type [feedback_parameter]
+    let parts: Vec<&str> = rtcp_fb.split_whitespace().collect();
+
+    if parts.is_empty() {
+        return Ok(());
+    }
+
+    let mut idx = 0;
+    // Check if first part is a payload type (numeric)
+    if let Ok(_) = parts[0].parse::<u8>() {
+        s.set("rtcp-fb-pt", parts[0]);
+        idx = 1;
+    }
+
+    if idx < parts.len() {
+        s.set("rtcp-fb-type", parts[idx]);
+        idx += 1;
+    }
+
+    if idx < parts.len() {
+        let fb_params: Vec<&str> = parts[idx..].to_vec();
+        s.set("rtcp-fb-params", fb_params.join(" "));
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_source_filter(source_filter: &str, s: &mut gst::structure::Structure) -> Result<(), RtspError> {
+    // The format is: filter-mode nettype addrtype src-list dst-addr
+    let parts: Vec<&str> = source_filter.split_whitespace().collect();
+
+    if parts.len() >= 4 {
+        s.set("filter-mode", parts[0]);
+        s.set("nettype", parts[1]);
+        s.set("addrtype", parts[2]);
+        s.set("src-list", parts[3]);
+
+        // Destination address might be present
+        if parts.len() >= 5 {
+            s.set("dst-addr", parts[4]);
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_ssrc(ssrc: &str, s: &mut gst::structure::Structure) -> Result<(), RtspError> {
+    // The format is: ssrc-id [attribute] or ssrc-id [cname: value | tool: value | ...]
+    let parts: Vec<&str> = ssrc.split_whitespace().collect();
+
+    if parts.is_empty() {
+        return Ok(());
+    }
+
+    // Parse the SSRC ID
+    if let Some(ssrc_id) = parts.first() {
+        // Split by colon to separate the SSRC ID from attributes
+        let ssrc_parts: Vec<&str> = ssrc_id.split(':').collect();
+        if !ssrc_parts.is_empty() {
+            s.set("ssrc-id", ssrc_parts[0]);
+
+            // If ssrc attribute has format like "ssrc-id:attrname=value", parse that too
+            if ssrc_parts.len() > 1 {
+                s.set(format!("ssrc-{}", ssrc_parts[0]), ssrc_parts[1..].join(":"));
+            }
+        }
+    }
+
+    // Process any additional attributes
+    if parts.len() > 1 {
+        for attr in &parts[1..] {
+            if let Some((attr_name, attr_value)) = attr.split_once('=') {
+                s.set(format!("ssrc-{}", attr_name), attr_value);
+            } else {
+                // Attribute without value, set to empty string
+                s.set(format!("ssrc-{}", attr), "");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 pub fn parse_media_attributes(
     attrs: &Vec<Attribute>,
     pt: u8,
     media: &str,
     s: &mut gst::structure::Structure,
 ) -> Result<(), RtspError> {
-    let mut skip_attrs = vec!["control", "range", "ssrc"];
+    let mut skip_attrs = vec!["control", "range"]; // Remove "ssrc" from hardcoded skip since we now parse it
 
     for Attribute { attribute, value } in attrs {
         let attr = attribute.as_str();
@@ -384,7 +567,12 @@ pub fn parse_media_attributes(
             "rtpmap" => parse_rtpmap(value, pt, media, s)?,
             "fmtp" => parse_fmtp(value, s),
             "framesize" => parse_framesize(value, s),
-            // TODO: extmap, key-mgmt, rid, rtcp-fb, source-filter, ssrc
+            "extmap" => parse_extmap(value, s)?,
+            "key-mgmt" => parse_key_mgmt(value, s)?,
+            "rid" => parse_rid(value, s)?,
+            "rtcp-fb" => parse_rtcp_fb(value, s)?,
+            "source-filter" => parse_source_filter(value, s)?,
+            "ssrc" => parse_ssrc(value, s)?,
             _ => s.set(format!("a-{attribute}"), value),
         };
         skip_attrs.push(attr);

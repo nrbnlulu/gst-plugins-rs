@@ -35,7 +35,9 @@
 use gst::glib;
 use gst::prelude::*;
 
+mod auth;
 mod body;
+mod connection;
 mod imp;
 mod sdp;
 mod tcp_message;
