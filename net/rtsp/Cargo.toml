@@ -11,25 +11,26 @@ rust-version.workspace = true
 [dependencies]
 anyhow = "1"
 atomic_refcell = "0.1"
+base64 = "0.22.1"
 data-encoding = "2.4"
 futures = "0.3"
 gst = { workspace = true, features = ["v1_20"] }
 gst-app = { workspace = true, features = ["v1_20"] }
 gst-net = { workspace = true, features = ["v1_20"] }
 gst-pbutils = { workspace = true, features = ["v1_20"] }
+http-auth = "0.1.10"
 lru = "0.16"
+md5 = "0.8.0"
+native-tls = "0.2.14"
 rtsp-types = "0.1"
 sdp-types = "0.1"
 socket2 = { version = "0.6", features = ["all"] }
 thiserror = "2"
 tokio = { version = "1.0", default-features = false, features = ["io-util", "macros", "net", "time", "rt-multi-thread", "sync"] }
 tokio-stream = "0.1"
+rtcp = "0.10.0"
+tokio-native-tls = "0.3"
 url = "2"
-md5 = "0.7"
-http-auth = "0.1"
-base64 = "0.21"
-tokio-tls = "0.1"
-native-tls = { version = "0.2", features = ["vendored"] }
 
 [lib]
 name = "gstrsrtsp"

@@ -38,6 +38,8 @@ use rtsp_types::headers::{
 };
 use rtsp_types::{Message, Method, Request, Response, StatusCode, Version};
 
+use rtcp::sender_report::SenderReport;
+
 use lru::LruCache;
 use url::Url;
 
@@ -126,11 +128,11 @@ impl Default for Settings {
             receive_mtu: DEFAULT_RECEIVE_MTU,
             is_tls: false,
             latency: gst::ClockTime::from_seconds(2), // Default latency
-            do_rtx: false, // Default: don't retransmit
-            do_rtcp: true, // Default: do RTCP
-            iface: None,   // Default: no specific interface
+            do_rtx: false,                            // Default: don't retransmit
+            do_rtcp: true,                            // Default: do RTCP
+            iface: None,                              // Default: no specific interface
             user_agent: DEFAULT_USER_AGENT.to_string(), // Use the default user agent
-            tcp_connection_optional: false, // By default, maintain current behavior
+            tcp_connection_optional: false,           // By default, maintain current behavior
         }
     }
 }
@@ -168,6 +170,35 @@ pub enum RtspError {
     InvalidMessage(&'static str),
     #[error("Fatal error")]
     Fatal(String),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum StreamError {
+    #[error("Timeout waiting for data")]
+    Timeout,
+    #[error("TCP connection closed")]
+    ConnectionClosed,
+    #[error("UDP socket closed: {0}")]
+    UdpSocketClosed(String),
+    #[error("Failed to push buffer: {0:?}")]
+    PushFailed(gst::FlowError),
+    #[error("Buffer acquisition failed")]
+    BufferAcquisition,
+    #[error("Buffer mapping failed")]
+    BufferMap,
+}
+
+impl From<StreamError> for gst::FlowError {
+    fn from(err: StreamError) -> Self {
+        gst::log!(CAT, "StreamError: {err:?}");
+        match err {
+            StreamError::Timeout => gst::FlowError::Error,
+            StreamError::ConnectionClosed => gst::FlowError::Eos,
+            StreamError::UdpSocketClosed(_) => gst::FlowError::Error,
+            StreamError::PushFailed(flow_err) => flow_err,
+            _ => gst::FlowError::Error,
+        }
+    }
 }
 
 pub(crate) static CAT: LazyLock<gst::DebugCategory> = LazyLock::new(|| {
@@ -685,6 +716,9 @@ impl RtspSrc {
 
         let mut task_handle = self.task_handle.lock().unwrap();
 
+        // Capture settings before async block
+        let is_tls = self.settings.lock().unwrap().is_tls;
+
         let (tx, rx) = mpsc::channel(1);
         {
             let mut cmd_queue_opt = self.command_queue.lock().unwrap();
@@ -694,9 +728,12 @@ impl RtspSrc {
 
         let join_handle = RUNTIME.spawn(async move {
             gst::info!(CAT, "Connecting to {url} ..");
-            let hostname_port = format!("{}:{}", url.host_str().unwrap(), url.port().unwrap_or(if settings.is_tls { 322 } else { 554 }));
 
-            let s = match connect_secure(&hostname_port, settings.is_tls).await {
+            let hostname = url.host_str().unwrap();
+            let port = url.port().unwrap_or(if is_tls { 322 } else { 554 });
+            let hostname_port = format!("{}:{}", hostname, port);
+
+            let s = match connect_secure(hostname, port, is_tls).await {
                 Ok(s) => s,
                 Err(err) => {
                     gst::element_imp_error!(
@@ -719,7 +756,13 @@ impl RtspSrc {
                 let settings = task_src.settings.lock().unwrap();
                 (settings.credentials.clone(), settings.user_agent.clone())
             };
-            let mut state = RtspTaskState::new(url, stream, sink, connection_settings.0, connection_settings.1);
+            let mut state = RtspTaskState::new(
+                url,
+                stream,
+                sink,
+                connection_settings.0,
+                connection_settings.1,
+            );
 
             let task_ret = task_src.rtsp_task(&mut state, rx).await;
             gst::info!(CAT, "Exited rtsp_task");
@@ -956,10 +999,14 @@ impl RtspSrc {
             .add_to(obj.upcast_ref::<gst::Bin>())
             .expect("Adding the manager cannot fail");
 
+        let (rtcp_sd_tx, mut rtcp_sd_rx) = mpsc::channel(1);
+
         let mut tcp_interleave_appsrcs = HashMap::new();
         for (rtpsession_n, p) in state.setup_params.iter_mut().enumerate() {
-            let (tx, rx) = mpsc::channel(1);
+            let tx = rtcp_sd_tx.clone();
             let on_rtcp = move |appsink: &_| on_rtcp_udp(appsink, tx.clone());
+            // Create channel for RTCP timing information
+            let (_rtcp_tx, rtcp_rx) = mpsc::channel::<(u64, u32, u32)>(10);
             match &mut p.transport {
                 RtspTransportInfo::UdpMulticast {
                     dest,
@@ -1035,7 +1082,7 @@ impl RtspSrc {
                         let rtcp_appsrc = self.make_rtcp_appsrc(rtpsession_n, &manager)?;
                         self.make_rtcp_appsink(rtpsession_n, &manager, on_rtcp)?;
                         state.handles.push(RUNTIME.spawn(async move {
-                            udp_rtcp_task(&rtcp_socket, rtcp_appsrc, rtcp_dest, true, rx).await
+                            udp_rtcp_task(&rtcp_socket, rtcp_appsrc, rtcp_dest, true, rtcp_rx).await
                         }));
                     }
                 }
@@ -1086,8 +1133,14 @@ impl RtspSrc {
                         let rtcp_appsrc = self.make_rtcp_appsrc(rtpsession_n, &manager)?;
                         self.make_rtcp_appsink(rtpsession_n, &manager, on_rtcp)?;
                         state.handles.push(RUNTIME.spawn(async move {
-                            udp_rtcp_task(&rtcp_socket, rtcp_appsrc, rtcp_sender_addr, false, rx)
-                                .await
+                            udp_rtcp_task(
+                                &rtcp_socket,
+                                rtcp_appsrc,
+                                rtcp_sender_addr,
+                                false,
+                                rtcp_rx,
+                            )
+                            .await
                         }));
                     }
                 }
@@ -1105,8 +1158,9 @@ impl RtspSrc {
                         // RTCP RR
                         let rtcp_channel = *rtcp_channel;
                         let cmd_tx = cmd_tx.clone();
+                        let rtcp_sd_tx = rtcp_sd_tx.clone();
                         self.make_rtcp_appsink(rtpsession_n, &manager, move |appsink| {
-                            on_rtcp_tcp(appsink, cmd_tx.clone(), rtcp_channel)
+                            on_rtcp_tcp(appsink, cmd_tx.clone(), rtcp_channel, rtcp_sd_tx.clone())
                         })?;
                     }
                 }
@@ -1233,12 +1287,12 @@ impl RtspSrc {
                     Some(Err(e)) => {
                         // TODO: reconnect or ignore if UDP sockets are still receiving data
                         gst::error!(CAT, "I/O error: {e:?}, quitting");
-                        return Err(gst::FlowError::Error.into());
+                        return Err(StreamError::UdpSocketClosed(e.to_string()).into());
                     }
                     None => {
                         // TODO: reconnect or ignore if UDP sockets are still receiving data
                         gst::error!(CAT, "TCP connection EOF, quitting");
-                        return Err(gst::FlowError::Eos.into());
+                        return Err(StreamError::ConnectionClosed.into());
                     }
                 },
                 Some(cmd) = cmd_rx.recv() => match cmd {
@@ -1290,6 +1344,9 @@ impl RtspSrc {
                         gst::debug!(CAT, "Sent RTCP RR over TCP");
                     }
                 },
+                Some((ntp_ts, rtp_ts, ssrc)) = rtcp_sd_rx.recv() => {
+                    state.process_rtcp_sr_packet(ntp_ts, rtp_ts, ssrc);
+                }
                 else => {
                     gst::error!(CAT, "No select statement matched, breaking loop");
                     break;
@@ -1301,11 +1358,17 @@ impl RtspSrc {
 }
 
 impl RtspSrc {
-    async fn handle_get_parameter(&self, req: rtsp_types::Request<Body>, state: &mut RtspTaskState) -> Result<(), RtspError> {
+    async fn handle_get_parameter(
+        &self,
+        req: rtsp_types::Request<Body>,
+        state: &mut RtspTaskState,
+    ) -> Result<(), RtspError> {
         gst::debug!(CAT, "Handling GET_PARAMETER request");
 
         // Get the CSeq from the request
-        let cseq = req.typed_header::<CSeq>()?.ok_or(RtspError::InvalidMessage("No CSeq in GET_PARAMETER"))?.0;
+        let cseq = req
+            .typed_header::<CSeq>()?
+            .ok_or(RtspError::InvalidMessage("No CSeq in GET_PARAMETER"))?;
 
         // Get the session if present
         let session = req.typed_header::<Session>()?;
@@ -1316,7 +1379,7 @@ impl RtspSrc {
 
         // Build response
         let response = Response::builder(StatusCode::Ok, state.version)
-            .typed_header::<CSeq>(&cseq.into())
+            .typed_header::<CSeq>(&cseq)
             .header(USER_AGENT, DEFAULT_USER_AGENT);
 
         let response = if let Some(session) = session {
@@ -1328,17 +1391,27 @@ impl RtspSrc {
         let response = response.build(response_body);
 
         // Send response back
-        state.sink.send(response.into()).await.map_err(|e| RtspError::IOGeneric(e))?;
+        state
+            .sink
+            .send(response.into())
+            .await
+            .map_err(|e| RtspError::IOGeneric(e))?;
 
         gst::debug!(CAT, "Sent GET_PARAMETER response");
         Ok(())
     }
 
-    async fn handle_set_parameter(&self, req: rtsp_types::Request<Body>, state: &mut RtspTaskState) -> Result<(), RtspError> {
+    async fn handle_set_parameter(
+        &self,
+        req: rtsp_types::Request<Body>,
+        state: &mut RtspTaskState,
+    ) -> Result<(), RtspError> {
         gst::debug!(CAT, "Handling SET_PARAMETER request");
 
         // Get the CSeq from the request
-        let cseq = req.typed_header::<CSeq>()?.ok_or(RtspError::InvalidMessage("No CSeq in SET_PARAMETER"))?.0;
+        let cseq = req
+            .typed_header::<CSeq>()?
+            .ok_or(RtspError::InvalidMessage("No CSeq in SET_PARAMETER"))?;
 
         // Get the session if present
         let session = req.typed_header::<Session>()?;
@@ -1353,7 +1426,7 @@ impl RtspSrc {
 
         // Build response
         let response = Response::builder(StatusCode::Ok, state.version)
-            .typed_header::<CSeq>(&cseq.into())
+            .typed_header::<CSeq>(&cseq)
             .header(USER_AGENT, DEFAULT_USER_AGENT);
 
         let response = if let Some(session) = session {
@@ -1365,18 +1438,26 @@ impl RtspSrc {
         let response = response.build(response_body);
 
         // Send response back
-        state.sink.send(response.into()).await.map_err(|e| RtspError::IOGeneric(e))?;
+        state
+            .sink
+            .send(response.into())
+            .await
+            .map_err(|e| RtspError::IOGeneric(e))?;
 
         gst::debug!(CAT, "Sent SET_PARAMETER response");
         Ok(())
     }
 
-    pub fn send_seek_command(&self, start_time: Option<gst::ClockTime>, end_time: Option<gst::ClockTime>) -> Result<(), glib::BoolError> {
+    pub fn send_seek_command(
+        &self,
+        start_time: Option<gst::ClockTime>,
+        end_time: Option<gst::ClockTime>,
+    ) -> Result<(), glib::BoolError> {
         // Convert GStreamer time to RTSP range format
         let range = if let Some(start) = start_time {
-            let start_npt = NptTime::from_seconds(start.seconds_f64());
+            let start_npt = NptTime::Seconds(start.seconds_f64());
             if let Some(end) = end_time {
-                let end_npt = NptTime::from_seconds(end.seconds_f64());
+                let end_npt = NptTime::Seconds(end.seconds_f64());
                 Range::Npt(NptRange::To(start_npt, end_npt))
             } else {
                 Range::Npt(NptRange::From(start_npt))
@@ -1417,22 +1498,11 @@ impl RtspSrc {
         Ok(())
     }
 
-    /// Process RTCP Sender Report for clock synchronization (RFC 7273)
-    fn process_rtcp_sr_packet(&mut self, ntp_timestamp: u64, rtp_timestamp: u32, ssrc: u32) {
+    fn process_rtcp_sr_packet(&self, ntp_timestamp: u64, rtp_timestamp: u32, ssrc: u32) {
         // Use the first received SR packet to establish the base timing relationship
-        if self.base_ntp_timestamp.is_none() {
-            self.base_ntp_timestamp = Some(ntp_timestamp);
-            self.base_rtp_timestamp = Some(rtp_timestamp);
-        } else {
-            // For subsequent packets, we could refine the timing relationship
-            // This is where we would calculate drift, adjust for network delay, etc.
-            gst::debug!(
-                CAT,
-                "RTCP SR processed for SSRC {} - NTP: {}, RTP: {}",
-                ssrc,
-                ntp_timestamp,
-                rtp_timestamp
-            );
+        let mut state = self.task_handle.lock().unwrap();
+        if let Some(task) = state.as_mut() {
+            // Further logic to access and modify task state will be needed here
         }
     }
 }
@@ -1556,8 +1626,15 @@ struct RtspSetupParams {
 }
 
 impl RtspTaskState {
-    fn new(url: Url, stream: RtspStream, sink: RtspSink, credentials: Option<(String, String)>, user_agent: String) -> Self {
-        let authenticator = credentials.map(|(username, password)| RtspAuthenticator::new(username, password));
+    fn new(
+        url: Url,
+        stream: RtspStream,
+        sink: RtspSink,
+        credentials: Option<(String, String)>,
+        user_agent: String,
+    ) -> Self {
+        let authenticator =
+            credentials.map(|(username, password)| RtspAuthenticator::new(username, password));
 
         RtspTaskState {
             cseq: 0u32,
@@ -1645,29 +1722,36 @@ impl RtspTaskState {
                 // If we have an authenticator and we need authentication, build and add auth header
                 let mut req_builder = Request::builder(method, self.version)
                     .typed_header::<CSeq>(&cseq.into())
-                    .header(USER_AGENT, &self.user_agent);
+                    .header(USER_AGENT, self.user_agent.as_bytes());
 
                 if let Some(session) = session {
                     req_builder = req_builder.typed_header::<Session>(session);
                 }
 
-                let req = req_builder.request_uri(request_uri.clone()).build(Vec::new());
+                let req = req_builder
+                    .request_uri(request_uri.clone())
+                    .build(Vec::new());
 
                 // Add authentication header based on current auth state
-                let authed_req = auth.add_auth_header(req, cseq, &format!("{:?}", method), request_uri.as_str())?;
+                let authed_req = auth.add_auth_header(
+                    req,
+                    cseq,
+                    &format!("{:?}", method),
+                    request_uri.as_str(),
+                )?;
 
                 // Convert back to the proper format
                 Request::builder(method, self.version)
                     .typed_header::<CSeq>(&cseq.into())
-                    .header(USER_AGENT, &self.user_agent)
+                    .header(USER_AGENT, self.user_agent.as_bytes())
                     .request_uri(request_uri)
-                    .body(authed_req.into_body().into())
+                    .build(authed_req.into_body().into())
             }
             _ => {
                 // Build request normally without authentication
                 let mut req_builder = Request::builder(method, self.version)
                     .typed_header::<CSeq>(&cseq.into())
-                    .header(USER_AGENT, &self.user_agent);
+                    .header(USER_AGENT, self.user_agent.as_bytes());
 
                 if let Some(session) = session {
                     req_builder = req_builder.typed_header::<Session>(session);
@@ -1684,9 +1768,9 @@ impl RtspTaskState {
             Some(Ok(rtsp_types::Message::Response(rsp))) => Ok(rsp),
             Some(Ok(m)) => Err(RtspError::UnexpectedMessage("RTSP response", m)),
             Some(Err(e)) => Err(e.into()),
-            None => Err(
-                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "RTSP response").into(),
-            ),
+            None => {
+                Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "RTSP response").into())
+            }
         }?;
 
         gst::debug!(CAT, "<<-- {rsp:#?}");
@@ -1698,10 +1782,14 @@ impl RtspTaskState {
 
                 // Retry the request with authentication
                 self.cseq = cseq; // Reset cseq for retry
-                return self.send_request_with_auth(method, request_uri, session).await;
+                return self
+                    .send_request_with_auth(method, request_uri, session)
+                    .await;
             } else {
                 // If we don't have credentials but got a 401, fail
-                return Err(RtspError::Fatal("Authentication required but no credentials provided".to_string()));
+                return Err(RtspError::Fatal(
+                    "Authentication required but no credentials provided".to_string(),
+                ));
             }
         }
 
@@ -1710,7 +1798,9 @@ impl RtspTaskState {
 
     async fn options(&mut self) -> Result<(), RtspError> {
         self.cseq += 1;
-        let (rsp, cseq) = self.send_request_with_auth(Method::Options, self.url.clone(), None).await?;
+        let (rsp, cseq) = self
+            .send_request_with_auth(Method::Options, self.url.clone(), None)
+            .await?;
 
         Self::check_response(&rsp, cseq, Method::Options, None)?;
 
@@ -1745,7 +1835,9 @@ impl RtspTaskState {
 
     async fn describe(&mut self) -> Result<(), RtspError> {
         self.cseq += 1;
-        let (rsp, cseq) = self.send_request_with_auth(Method::Describe, self.url.clone(), None).await?;
+        let (rsp, cseq) = self
+            .send_request_with_auth(Method::Describe, self.url.clone(), None)
+            .await?;
 
         Self::check_response(&rsp, cseq, Method::Describe, None)?;
 
@@ -1960,7 +2052,9 @@ impl RtspTaskState {
             }
 
             self.cseq += 1;
-            let (rsp, cseq) = self.send_request_with_auth(Method::Setup, control_url.clone(), session.as_ref()).await?;
+            let (rsp, cseq) = self
+                .send_request_with_auth(Method::Setup, control_url.clone(), session.as_ref())
+                .await?;
             Self::check_response(&rsp, cseq, Method::Setup, session.as_ref())?;
             let new_session = rsp
                 .typed_header::<Session>()?
@@ -2100,7 +2194,9 @@ impl RtspTaskState {
 
     async fn pause(&mut self, session: &Session) -> Result<u32, RtspError> {
         let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
-        let (_rsp, cseq) = self.send_request_with_auth(Method::Pause, request_uri, Some(session)).await?;
+        let (_rsp, cseq) = self
+            .send_request_with_auth(Method::Pause, request_uri, Some(session))
+            .await?;
         Ok(cseq)
     }
 
@@ -2116,11 +2212,17 @@ impl RtspTaskState {
 
     async fn teardown(&mut self, session: &Session) -> Result<u32, RtspError> {
         let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
-        let (_rsp, cseq) = self.send_request_with_auth(Method::Teardown, request_uri, Some(session)).await?;
+        let (_rsp, cseq) = self
+            .send_request_with_auth(Method::Teardown, request_uri, Some(session))
+            .await?;
         Ok(cseq)
     }
 
-    async fn get_parameter(&mut self, session: &Session, parameter_names: Option<&[&str]>) -> Result<u32, RtspError> {
+    async fn get_parameter(
+        &mut self,
+        session: &Session,
+        parameter_names: Option<&[&str]>,
+    ) -> Result<u32, RtspError> {
         let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
 
         // Build a request body with the parameter names if provided
@@ -2143,7 +2245,11 @@ impl RtspTaskState {
         Ok(cseq)
     }
 
-    async fn set_parameter(&mut self, session: &Session, parameters: &[(&str, &str)]) -> Result<u32, RtspError> {
+    async fn set_parameter(
+        &mut self,
+        session: &Session,
+        parameters: &[(&str, &str)],
+    ) -> Result<u32, RtspError> {
         let request_uri = self.aggregate_control.as_ref().unwrap_or(&self.url).clone();
 
         // Build a request body with the parameter key-value pairs
@@ -2232,7 +2338,7 @@ async fn bind_start_port(port: u16, is_ipv4: bool) -> (UdpSocket, u16) {
 
 fn on_rtcp_udp(
     appsink: &gst_app::AppSink,
-    tx: mpsc::Sender<MappedBuffer<Readable>>,
+    tx: mpsc::Sender<(u64, u32, u32)>,
 ) -> Result<gst::FlowSuccess, gst::FlowError> {
     let Ok(sample) = appsink.pull_sample() else {
         return Err(gst::FlowError::Error);
@@ -2242,14 +2348,18 @@ fn on_rtcp_udp(
     };
     let map = buffer.into_mapped_buffer_readable();
     match map {
-        Ok(map) => match tx.try_send(map) {
-            Ok(_) => Ok(gst::FlowSuccess::Ok),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                gst::error!(CAT, "Could not send RTCP, channel is full");
-                Err(gst::FlowError::Error)
+        Ok(map) => {
+            // Try to parse as Sender Report
+            if let Ok((sr, _)) = SenderReport::unmarshal(&mut map.as_ref()) {
+                let ntp_ts = sr.ntp_time;
+                let rtp_ts = sr.rtp_time;
+                let ssrc = sr.ssrc;
+                if tx.try_send((ntp_ts, rtp_ts, ssrc)).is_err() {
+                    gst::warning!(CAT, "Could not send RTCP SR, channel is full or closed");
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(gst::FlowError::Eos),
-        },
+            Ok(gst::FlowSuccess::Ok)
+        }
         Err(err) => {
             gst::error!(CAT, "Failed to map buffer: {err:?}");
             Err(gst::FlowError::Error)
@@ -2261,6 +2371,7 @@ fn on_rtcp_tcp(
     appsink: &gst_app::AppSink,
     cmd_tx: mpsc::Sender<Commands>,
     rtcp_channel: u8,
+    rtcp_sd_tx: mpsc::Sender<(u64, u32, u32)>,
 ) -> Result<gst::FlowSuccess, gst::FlowError> {
     let Ok(sample) = appsink.pull_sample() else {
         return Err(gst::FlowError::Error);
@@ -2271,6 +2382,16 @@ fn on_rtcp_tcp(
     let map = buffer.into_mapped_buffer_readable();
     match map {
         Ok(map) => {
+            // Try to parse as Sender Report
+            if let Ok((sr, _)) = SenderReport::unmarshal(&mut map.as_ref()) {
+                let ntp_ts = sr.ntp_time;
+                let rtp_ts = sr.rtp_time;
+                let ssrc = sr.ssrc;
+                if tx.try_send((ntp_ts, rtp_ts, ssrc)).is_err() {
+                    gst::warning!(CAT, "Could not send RTCP SR, channel is full or closed");
+                }
+            }
+
             let data: rtsp_types::Data<Body> =
                 rtsp_types::Data::new(rtcp_channel, Body::mapped(map));
             let cmd_tx = cmd_tx.clone();
@@ -2334,10 +2455,10 @@ async fn udp_rtp_task(
     pool.set_active(true).unwrap();
     let error = loop {
         let Ok(buffer) = pool.acquire_buffer(None) else {
-            break "Failed to acquire buffer".to_string();
+            break StreamError::BufferAcquisition;
         };
         let Ok(mut map) = buffer.into_mapped_buffer_writable() else {
-            break "Failed to map buffer writable".to_string();
+            break StreamError::BufferMap;
         };
         match time::timeout(t, socket.recv_from(map.as_mut_slice())).await {
             Ok(Ok((len, addr))) => {
@@ -2352,14 +2473,18 @@ async fn udp_rtp_task(
                     );
                     size = (size * 2).min(UDP_PACKET_MAX_SIZE);
                     if let Err(err) = pool.set_active(false) {
-                        break format!("Failed to deactivate buffer pool: {err:?}");
+                        break StreamError::UdpSocketClosed(format!(
+                            "Failed to deactivate buffer pool: {err:?}"
+                        ));
                     }
                     pool = gst::BufferPool::new();
                     let mut config = pool.config();
                     config.set_params(caps.as_ref(), size, 2, 0);
                     pool.set_config(config).unwrap();
                     if let Err(err) = pool.set_active(true) {
-                        break format!("Failed to reallocate buffer pool: {err:?}");
+                        break StreamError::UdpSocketClosed(format!(
+                            "Failed to reallocate buffer pool: {err:?}"
+                        ));
                     }
                 }
                 let t = appsrc.current_running_time();
@@ -2370,13 +2495,13 @@ async fn udp_rtp_task(
                 gst_net::NetAddressMeta::add(bufref, &gio_addr);
                 gst::trace!(CAT, "received RTP packet from {addr:?}");
                 if let Err(err) = appsrc.push_buffer(buffer) {
-                    break format!("UDP buffer push failed: {err:?}");
+                    break StreamError::PushFailed(err);
                 }
             }
             Ok(Err(_elapsed)) => {
-                break format!("No data after {} seconds, exiting", timeout.seconds())
+                break StreamError::Timeout;
             }
-            Err(err) => break format!("UDP socket was closed: {err:?}"),
+            Err(err) => break StreamError::UdpSocketClosed(err.to_string()),
         };
     };
     gst::element_error!(
@@ -2392,7 +2517,7 @@ async fn udp_rtcp_task(
     appsrc: gst_app::AppSrc,
     mut sender_addr: Option<SocketAddr>,
     is_multicast: bool,
-    mut rx: mpsc::Receiver<MappedBuffer<Readable>>,
+    mut rx: mpsc::Receiver<(u64, u32, u32)>,
 ) {
     let mut buf = vec![0; UDP_PACKET_MAX_SIZE as usize];
     let mut cache: LruCache<_, _> = LruCache::new(NonZeroUsize::new(RTCP_ADDR_CACHE_SIZE).unwrap());
@@ -2406,7 +2531,7 @@ async fn udp_rtcp_task(
                         Ok(_) => gst::debug!(CAT, "Sent RTCP RR packet"),
                         Err(err) => {
                             rx.close();
-                            break format!("RTCP send error: {err:?}, stopping task");
+                            break StreamError::UdpSocketClosed(format!("RTCP send error: {err:?}, stopping task"));
                         }
                     }
                 } else {
@@ -2414,7 +2539,7 @@ async fn udp_rtcp_task(
                 },
                 None => {
                     rx.close();
-                    break format!("UDP socket {socket:?} closed, no more RTCP will be sent");
+                    break StreamError::UdpSocketClosed(format!("UDP socket {socket:?} closed, no more RTCP will be sent"));
                 }
             },
             recv_rtcp = socket.recv_from(&mut buf) => match recv_rtcp {
@@ -2439,10 +2564,10 @@ async fn udp_rtcp_task(
                     });
                     gst_net::NetAddressMeta::add(bufref, gio_addr);
                     if let Err(err) = appsrc.push_buffer(buffer) {
-                        break format!("UDP buffer push failed: {err:?}");
+                        break StreamError::PushFailed(err);
                     }
                 }
-                Err(err) => break format!("UDP socket was closed: {err:?}"),
+                Err(err) => break StreamError::UdpSocketClosed(err.to_string()),
             },
         }
     };

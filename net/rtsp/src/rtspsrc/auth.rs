@@ -8,12 +8,9 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use std::collections::HashMap;
-use http_auth::{AuthContext, Challenge, Credentials, HttpAuthHeader};
-use md5::Md5;
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 
-use rtsp_types::headers::{WWW_AUTHENTICATE, AUTHORIZATION};
+use rtsp_types::headers::{AUTHORIZATION, WWW_AUTHENTICATE};
 use rtsp_types::{Message, Request, Response, StatusCode, Version};
 
 #[derive(Debug)]
@@ -53,7 +50,10 @@ impl RtspAuthenticator {
         self.auth_type.is_some()
     }
 
-    pub fn handle_401_challenge(&mut self, response: &Response<Vec<u8>>) -> Result<(), crate::imp::RtspError> {
+    pub fn handle_401_challenge(
+        &mut self,
+        response: &Response<Vec<u8>>,
+    ) -> Result<(), crate::rtspsrc::imp::RtspError> {
         if response.status() != StatusCode::Unauthorized {
             return Ok(());
         }
@@ -74,20 +74,23 @@ impl RtspAuthenticator {
         Ok(())
     }
 
-    fn parse_digest_params(&mut self, header: &str) -> Result<(), crate::imp::RtspError> {
+    fn parse_digest_params(&mut self, header: &str) -> Result<(), crate::rtspsrc::imp::RtspError> {
         // Parse the digest parameters from the WWW-Authenticate header
         let auth_line = &header[6..].trim(); // Remove "Digest" prefix
-        
+
         // Split the parameters by comma
         for param in auth_line.split(',') {
             let parts: Vec<&str> = param.splitn(2, '=').map(|s| s.trim()).collect();
             if parts.len() != 2 {
                 continue;
             }
-            
+
             let key = parts[0].trim_start_matches('"').trim_end_matches('"');
-            let value = parts[1].trim().trim_start_matches('"').trim_end_matches('"');
-            
+            let value = parts[1]
+                .trim()
+                .trim_start_matches('"')
+                .trim_end_matches('"');
+
             match key.to_lowercase().as_str() {
                 "realm" => self.realm = Some(value.to_string()),
                 "nonce" => self.nonce = Some(value.to_string()),
@@ -99,13 +102,21 @@ impl RtspAuthenticator {
         }
 
         if self.realm.is_none() || self.nonce.is_none() {
-            return Err(crate::imp::RtspError::Fatal("Digest auth missing required parameters".to_string()));
+            return Err(crate::rtspsrc::imp::RtspError::Fatal(
+                "Digest auth missing required parameters".to_string(),
+            ));
         }
 
         Ok(())
     }
 
-    pub fn add_auth_header(&self, request: Request<Vec<u8>>, cseq: u32, method: &str, uri: &str) -> Result<Request<Vec<u8>>, crate::imp::RtspError> {
+    pub fn add_auth_header(
+        &self,
+        request: Request<Vec<u8>>,
+        cseq: u32,
+        method: &str,
+        uri: &str,
+    ) -> Result<Request<Vec<u8>>, crate::rtspsrc::imp::RtspError> {
         match self.auth_type {
             Some(AuthenticationType::Basic) => self.add_basic_auth(request, cseq),
             Some(AuthenticationType::Digest) => self.add_digest_auth(request, cseq, method, uri),
@@ -113,18 +124,45 @@ impl RtspAuthenticator {
         }
     }
 
-    fn add_basic_auth(&self, mut request: Request<Vec<u8>>, cseq: u32) -> Result<Request<Vec<u8>>, crate::imp::RtspError> {
+    fn add_basic_auth(
+        &self,
+        request: Request<Vec<u8>>,
+        cseq: u32,
+    ) -> Result<Request<Vec<u8>>, crate::rtspsrc::imp::RtspError> {
         let credentials = format!("{}:{}", self.username, self.password);
         let encoded = BASE64_STANDARD.encode(credentials);
         let auth_value = format!("Basic {}", encoded);
 
-        request.headers_mut().insert(AUTHORIZATION, auth_value.as_bytes());
-        Ok(request)
+        // Rebuild the request with the authorization header
+        let mut builder = Request::builder(request.method().clone(), request.version());
+
+        // Copy existing headers
+        for (name, value) in request.headers() {
+            if name != &AUTHORIZATION {
+                builder = builder.header(name.clone(), value);
+            }
+        }
+
+        // Add authorization header
+        builder = builder.header(AUTHORIZATION, auth_value.as_bytes());
+
+        // Build with the same URI and body
+        Ok(builder
+            .request_uri(request.request_uri().clone())
+            .build(request.into_body()))
     }
 
-    fn add_digest_auth(&self, mut request: Request<Vec<u8>>, cseq: u32, method: &str, uri: &str) -> Result<Request<Vec<u8>>, crate::imp::RtspError> {
+    fn add_digest_auth(
+        &self,
+        request: Request<Vec<u8>>,
+        cseq: u32,
+        method: &str,
+        uri: &str,
+    ) -> Result<Request<Vec<u8>>, crate::rtspsrc::imp::RtspError> {
         if self.realm.is_none() || self.nonce.is_none() {
-            return Err(crate::imp::RtspError::Fatal("Digest auth parameters not set".to_string()));
+            return Err(crate::rtspsrc::imp::RtspError::Fatal(
+                "Digest auth parameters not set".to_string(),
+            ));
         }
 
         let realm = self.realm.as_ref().unwrap();
@@ -132,15 +170,11 @@ impl RtspAuthenticator {
 
         // Calculate HA1: MD5(username:realm:password)
         let ha1_input = format!("{}:{}:{}", self.username, realm, self.password);
-        let mut hasher = Md5::new();
-        hasher.update(ha1_input.as_bytes());
-        let ha1 = format!("{:x}", hasher.finalize());
+        let ha1 = format!("{:x}", md5::compute(ha1_input.as_bytes()));
 
         // Calculate HA2: MD5(method:digestURI)
         let ha2_input = format!("{}:{}", method, uri);
-        let mut hasher = Md5::new();
-        hasher.update(ha2_input.as_bytes());
-        let ha2 = format!("{:x}", hasher.finalize());
+        let ha2 = format!("{:x}", md5::compute(ha2_input.as_bytes()));
 
         // Calculate response: MD5(HA1:nonce:HA2)
         let response_input = if self.qop.as_deref() == Some("auth") {
@@ -153,9 +187,7 @@ impl RtspAuthenticator {
             format!("{}:{}:{}", ha1, nonce, ha2)
         };
 
-        let mut hasher = Md5::new();
-        hasher.update(response_input.as_bytes());
-        let response = format!("{:x}", hasher.finalize());
+        let response = format!("{:x}", md5::compute(response_input.as_bytes()));
 
         let mut auth_parts = vec![
             format!("username=\"{}\"", self.username),
@@ -184,7 +216,22 @@ impl RtspAuthenticator {
 
         let auth_value = format!("Digest {}", auth_parts.join(", "));
 
-        request.headers_mut().insert(AUTHORIZATION, auth_value.as_bytes());
-        Ok(request)
+        // Rebuild the request with the authorization header
+        let mut builder = Request::builder(request.method().clone(), request.version());
+
+        // Copy existing headers
+        for (name, value) in request.headers() {
+            if name != &AUTHORIZATION {
+                builder = builder.header(name.clone(), value);
+            }
+        }
+
+        // Add authorization header
+        builder = builder.header(AUTHORIZATION, auth_value.as_bytes());
+
+        // Build with the same URI and body
+        Ok(builder
+            .request_uri(request.request_uri().clone())
+            .build(request.into_body()))
     }
 }

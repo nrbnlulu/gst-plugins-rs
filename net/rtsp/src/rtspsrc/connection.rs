@@ -9,10 +9,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use std::io;
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use native_tls::TlsConnector;
-use tokio_tls::TlsStream;
+use tokio_native_tls::TlsStream;
 
 pub enum SecureTcpStream {
     Plain(TcpStream),
@@ -21,58 +22,56 @@ pub enum SecureTcpStream {
 
 impl AsyncRead for SecureTcpStream {
     fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         match &mut *self {
-            SecureTcpStream::Plain(ref mut s) => std::pin::Pin::new(s).poll_read(cx, buf),
-            SecureTcpStream::Tls(ref mut s) => std::pin::Pin::new(s).poll_read(cx, buf),
+            SecureTcpStream::Plain(ref mut s) => Pin::new(s).poll_read(cx, buf),
+            SecureTcpStream::Tls(ref mut s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
 
 impl AsyncWrite for SecureTcpStream {
     fn poll_write(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<io::Result<usize>> {
+    ) -> Poll<io::Result<usize>> {
         match &mut *self {
-            SecureTcpStream::Plain(ref mut s) => std::pin::Pin::new(s).poll_write(cx, buf),
-            SecureTcpStream::Tls(ref mut s) => std::pin::Pin::new(s).poll_write(cx, buf),
+            SecureTcpStream::Plain(ref mut s) => Pin::new(s).poll_write(cx, buf),
+            SecureTcpStream::Tls(ref mut s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
-    fn poll_flush(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
-            SecureTcpStream::Plain(ref mut s) => std::pin::Pin::new(s).poll_flush(cx),
-            SecureTcpStream::Tls(ref mut s) => std::pin::Pin::new(s).poll_flush(cx),
+            SecureTcpStream::Plain(ref mut s) => Pin::new(s).poll_flush(cx),
+            SecureTcpStream::Tls(ref mut s) => Pin::new(s).poll_flush(cx),
         }
     }
 
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut *self {
-            SecureTcpStream::Plain(ref mut s) => std::pin::Pin::new(s).poll_shutdown(cx),
-            SecureTcpStream::Tls(ref mut s) => std::pin::Pin::new(s).poll_shutdown(cx),
+            SecureTcpStream::Plain(ref mut s) => Pin::new(s).poll_shutdown(cx),
+            SecureTcpStream::Tls(ref mut s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
 
-pub async fn connect_secure(hostname_port: &str, is_tls: bool) -> Result<SecureTcpStream, Box<dyn std::error::Error>> {
-    let stream = TcpStream::connect(hostname_port).await?;
-    
+pub async fn connect_secure(
+    hostname: &str,
+    port: u16,
+    is_tls: bool,
+) -> Result<SecureTcpStream, Box<dyn std::error::Error>> {
+    let addr = format!("{}:{}", hostname, port);
+    let stream = TcpStream::connect(&addr).await?;
+
     if is_tls {
-        let connector = TlsConnector::builder().build()?;
-        let tls_stream = tokio_tls::TlsConnector::from(connector)
-            .connect(&hostname_port.split(':').next().unwrap_or(""), stream)
-            .await?;
+        let connector = native_tls::TlsConnector::builder().build()?;
+        let connector = tokio_native_tls::TlsConnector::from(connector);
+        let tls_stream = connector.connect(hostname, stream).await?;
         Ok(SecureTcpStream::Tls(tls_stream))
     } else {
         Ok(SecureTcpStream::Plain(stream))
